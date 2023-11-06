@@ -53,7 +53,7 @@ namespace mcech::memory
          *
          * @param   x   Another PoolAllocator to construct from
          */
-        constexpr PoolAllocator(const PoolAllocator& x) noexcept = default;
+        constexpr PoolAllocator(const PoolAllocator&) noexcept = default;
 
         /**
          * @brief   Copy-construct PoolAllocator object
@@ -112,6 +112,8 @@ namespace mcech::memory
          */
         constexpr void deallocate(value_type* p, size_type n);
 
+        constexpr void clear() noexcept;
+
         /**
          * @brief   Compares the PoolAllocators lhs and rhs
          *
@@ -133,48 +135,60 @@ namespace mcech::memory
                 const PoolAllocator<T2>& rhs) noexcept;
 
     private:
-        union Node
+        class  Pool;
+        struct Node;
+
+        static thread_local Pool pool;
+    };
+
+    template <class T>
+    struct PoolAllocator<T>::Node
+    {
+        union
         {
-            Node* next;
             T value;
+            Node* next;
         };
+        Pool* pool;
+    };
 
-        class SharedPool
+    template <class T>
+    class PoolAllocator<T>::Pool
+    {
+    public:
+        constexpr Pool() = default;
+    
+        constexpr ~Pool()
         {
-        public:
-            constexpr ~SharedPool();
+            clear();
+        }
 
-            constexpr Node* load() const noexcept;
-            constexpr bool try_compare_exchange(Node*& expected, Node* desired) noexcept;
-            constexpr void compare_exchange(Node*& expected, Node* desired) noexcept;
-
-        private:
-            std::atomic<Node*> head = nullptr;
-        };
-
-        class LocalPool
+        constexpr Node* load() const noexcept
         {
-        public:
-            constexpr LocalPool(SharedPool& shared);
-            constexpr ~LocalPool();
-            constexpr LocalPool& operator=(Node* p) noexcept;
-            constexpr operator Node*&() noexcept;
-            constexpr operator const Node*() const noexcept;
+            return sentinel.load(std::memory_order_consume);
+        }
 
-        private:
-            SharedPool& shared;
-            Node* head = nullptr;
-        };
+        constexpr void compare_exchange(Node*& expected, Node* desired) noexcept
+        {
+            while (!sentinel.compare_exchange_weak(expected, desired, std::memory_order_acq_rel, std::memory_order_consume))
+            {
+            }
+        }
 
-        constexpr T*   alloc(size_t n);
-        constexpr void add_to_shared_pool(T* p);
-        constexpr void move_from_shared_to_local_pool() noexcept;
-        constexpr T*   reuse_from_local_pool();
-        constexpr void move_from_local_to_shared_pool() noexcept;
-        constexpr void dealloc(T* p, size_t n);
+        constexpr void clear() noexcept
+        {
+            Node* p = sentinel.load(std::memory_order_consume);
+            while (p != nullptr)
+            {
+                Node* next = p->next;
+                sentinel.store(next, std::memory_order_relaxed);
+                ::operator delete(static_cast<void*>(p));
+                p = next;
+            }
+        }
 
-        static SharedPool shared_pool;
-        static thread_local LocalPool local_pool;
+    private:
+        std::atomic<Node*> sentinel = nullptr;
     };
 
     template <class T>
@@ -188,29 +202,46 @@ namespace mcech::memory
     {
         if (n == 1)
         {
-            move_from_shared_to_local_pool();
-            value_type* p = reuse_from_local_pool();
-            move_from_local_to_shared_pool();
-            if (p != nullptr)
+            Node* node = pool.load();
+            if (node != nullptr)
             {
-                return p;
+                pool.compare_exchange(node, node->next);
             }
+            else
+            {
+                node = static_cast<Node*>(::operator new(sizeof(Node)));
+                node->pool = &pool;
+            }
+            return reinterpret_cast<value_type*>(node);
         }
 
-        return alloc(n);
+        return static_cast<value_type*>(::operator new(n * sizeof(Node)));
     }
 
     template <class T>
     inline constexpr void PoolAllocator<T>::deallocate(value_type* p, size_type n)
     {
+        if(p == nullptr || n == 0)
+        {
+            return;
+        }
+
         if (n == 1)
         {
-            add_to_shared_pool(p);
+            Node* node = reinterpret_cast<Node*>(p);
+            node->next = node->pool->load();
+            node->pool->compare_exchange(node->next, node);
         }
         else
         {
-            dealloc(p, n);
+            ::operator delete(static_cast<void*>(p), n * sizeof(value_type));
         }
+    }
+
+    template <class T>
+    inline constexpr void PoolAllocator<T>::clear() noexcept
+    {
+        pool.clear();
     }
 
     template <class T1, class T2>
@@ -220,131 +251,5 @@ namespace mcech::memory
     }
 
     template <class T>
-    inline constexpr PoolAllocator<T>::SharedPool::~SharedPool()
-    {
-        Node* p = head.load();
-        while (p != nullptr)
-        {
-            head.compare_exchange_weak(p, p->next);
-            ::operator delete(static_cast<void*>(p));
-            p = head.load();
-        }
-    }
-
-    template <class T>
-    inline constexpr typename PoolAllocator<T>::Node* PoolAllocator<T>::SharedPool::load() const noexcept
-    {
-        return head.load();
-    }
-
-    template <class T>
-    inline constexpr bool PoolAllocator<T>::SharedPool::try_compare_exchange(Node*& expected, Node* desired) noexcept
-    {
-        return head.compare_exchange_weak(expected, desired);
-    }
-
-    template <class T>
-    inline constexpr void PoolAllocator<T>::SharedPool::compare_exchange(Node*& expected, Node* desired) noexcept
-    {
-        while (!head.compare_exchange_weak(expected, desired))
-        {
-        }
-    }
-
-    template <class T>
-    inline constexpr PoolAllocator<T>::LocalPool::LocalPool(SharedPool& shared) : shared(shared)
-    {
-    }
-
-    template <class T>
-    inline constexpr PoolAllocator<T>::LocalPool::~LocalPool()
-    {
-        Node* null_ptr = nullptr;
-        if (!shared.try_compare_exchange(null_ptr, head))
-        {
-            while (head != nullptr)
-            {
-                Node* p = head;
-                head = p->next;
-                p->next = shared.load();
-                shared.compare_exchange(p->next, p);
-            }
-        }
-    }
-
-    template <class T>
-    inline constexpr PoolAllocator<T>::LocalPool& PoolAllocator<T>::LocalPool::operator=(Node* p) noexcept
-    {
-        head = p;
-        return *this;
-    }
-
-    template <class T>
-    inline constexpr PoolAllocator<T>::LocalPool::operator typename PoolAllocator<T>::Node*&() noexcept
-    {
-        return head;
-    }
-
-    template <class T>
-    inline constexpr PoolAllocator<T>::LocalPool::operator const typename PoolAllocator<T>::Node*() const noexcept
-    {
-        return head;
-    }
-
-    template <class T>
-    inline constexpr T* PoolAllocator<T>::alloc(size_t n)
-    {
-        return static_cast<T*>(::operator new(n * sizeof(Node)));
-    }
-
-    template <class T>
-    inline constexpr void PoolAllocator<T>::add_to_shared_pool(T* p)
-    {
-        Node* node = reinterpret_cast<Node*>(p);
-        node->next = shared_pool.load();
-        shared_pool.compare_exchange(node->next, node);
-    }
-
-    template <class T>
-    inline constexpr void PoolAllocator<T>::move_from_shared_to_local_pool() noexcept
-    {
-        if (local_pool == nullptr)
-        {
-            local_pool = shared_pool.load();
-            shared_pool.compare_exchange(local_pool, nullptr);
-        }
-    }
-
-    template <class T>
-    inline constexpr T* PoolAllocator<T>::reuse_from_local_pool()
-    {
-        Node* p = local_pool;
-        if (p != nullptr)
-        {
-            local_pool = p->next;
-        }
-        return reinterpret_cast<T*>(p);
-    }
-
-    template <class T>
-    inline constexpr void PoolAllocator<T>::move_from_local_to_shared_pool() noexcept
-    {
-        Node* null_ptr = nullptr;
-        if (shared_pool.try_compare_exchange(null_ptr, local_pool))
-        {
-            local_pool = nullptr;
-        }
-    }
-
-    template <class T>
-    inline constexpr void PoolAllocator<T>::dealloc(T* p, size_t n)
-    {
-        ::operator delete(static_cast<void*>(p), n * sizeof(Node));
-    }
-
-    template <class T>
-    typename PoolAllocator<T>::SharedPool PoolAllocator<T>::shared_pool;
-
-    template <class T>
-    thread_local PoolAllocator<T>::LocalPool PoolAllocator<T>::local_pool(shared_pool);
+    thread_local typename PoolAllocator<T>::Pool PoolAllocator<T>::pool;
 }
